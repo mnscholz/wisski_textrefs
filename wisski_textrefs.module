@@ -1,0 +1,217 @@
+<?php
+
+
+/**
+* @author Martin Scholz, unless otherwise noted
+*/
+
+
+function wisski_textrefs_perm() {
+  return array('wisski delete text references', 'wisski view text references');
+}
+
+
+
+function wisski_textrefs_menu() {
+
+  $items['node/%node/textrefs'] = array(
+    'title' => 'References',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('wisski_textrefs_list_form', 1),
+    'access arguments' => array('wisski view text references'),
+    'type' => MENU_LOCAL_TASK,
+  );
+  return $items;
+
+}
+
+
+function wisski_textrefs_list_form($form_state, $node) {
+  
+  $form = array();
+
+  $not_empty = _wisski_textrefs_list_form($form, $node);
+  
+  if (user_access('wisski delete text references')) {
+    if (!$not_empty) {
+      $form['no_refs']['#value'] = t('<p>No references in texts could be found.<p>');
+    } else {
+      $form['submit'] = array(
+        '#type' => 'submit',
+        '#value' => t('Delete references'),
+      );
+    }
+  }
+
+  return $form;
+
+}
+
+
+function _wisski_textrefs_list_form(&$form, $node) {
+
+  $inst = wisski_store_getObj()->wisski_ARCAdapter_delNamespace($node->title);
+
+  list($ok, $text_insts) = _wisski_textrefs_collect_references($inst);
+  
+  if ($ok && empty($text_insts)) return FALSE;
+
+  if (!$ok) {
+    foreach ((array) $text_insts as $error) {
+      drupal_set_message($e, 'error');
+    }
+    return FALSE;
+  }
+  
+  $uris = array_keys($text_insts);
+  $titles  = array_map('wisski_pathbuilder_generateGroupName', $uris, array_values($text_insts));
+  $links   = array_map('l', $titles, $uris);
+  $options = array_combine($uris, $links);
+
+  $form['textrefs_references_fs'] = array(
+    '#type' => 'fieldset',
+    '#weight' => -100,
+  );
+  $form['textrefs_references_fs']['textrefs_references'] = array(
+    '#type' => 'checkboxes',
+    '#title' => t('Texts containing references to this entity'),
+    '#description' => t('Check the listed texts to also delete the references to this entity in the texts.'),
+    '#options' => $options,
+    '#default_value' => $uris,
+  );
+
+  // add a handler, so that we can perform the reference deletion
+  // this handler must be executed _before_ the default handler as the latter breaks execution!
+  if (!isset($form['#submit'])) $form['#submit'] = array();
+  array_unshift($form['#submit'], '_wisski_textrefs_delete_submit');
+
+  return TRUE;
+
+}
+
+
+
+//function wisski_textrefs_form_wisski_delNodeQuestion_alter (&$form, &$form_state) {
+
+function wisski_textrefs_form_alter (&$form, &$form_state, $form_id) {
+  if ($form_id != 'wisski_delNodeQuestion') return;
+  if ($form_state['submitted']) return;
+  if (isset($form_state['post']) && !empty($form_state['post'])) return;
+  if (!user_access('wisski delete text references')) return;
+  
+  $node = node_load(arg(1));
+  
+  $not_empty = _wisski_textrefs_list_form($form, $node);
+  
+  if ($not_empty) {
+    drupal_set_message(t('<strong>Caution:</strong> This entity is being referred to in some texts. You should also delete the references in the texts in order to delete the entity properly. Check the box below for a list of found references.'), 'warning');
+  }
+
+}
+
+
+function _wisski_textrefs_delete_submit($form, $form_state) {
+  $text_insts = array_filter($form_state['values']['textrefs_references']);
+  $node = node_load(arg(1));
+  $inst = wisski_store_getObj()->wisski_ARCAdapter_delNamespace($node->title);
+
+  list($ok, $errors) = wisski_textrefs_delete_references($inst, $text_insts);
+  if (!$ok) {
+    foreach ($errors as $e) drupal_set_message($e, 'error');
+  }
+   
+}
+
+
+function _wisski_textrefs_collect_references($insts) {
+  
+  // if we got a string with a single uri, we coerce it to an array 
+  $insts = (array) $insts;
+  if (empty($insts)) return array(TRUE, array());
+
+  $text_insts = array();
+  
+  $model = wisski_textmod_get_model();
+
+  $encoded_uris = array_map('_wisski_textrefs_encode_uri_component', $insts);
+  $encoded_uris = array_map('wisski_store_escape_sparql_regex', $encoded_uris); // we don't need to sparql literal escape since the uriencode already escaped them...
+  $cond = " FILTER (REGEX(str(?out), '" . join('|', $encoded_uris) . "'))";
+  
+  $store = wisski_store_getObj()->wisski_ARCAdapter_getStore();
+
+  foreach ($model['text_classes'] as $tc) {
+    $pathdata = wisski_pathbuilder_getPathData($tc['canonical_path']);
+    $x = max(0, $pathdata['disamb'] - 1);
+    $sparql = wisski_pathbuilder_get_sparql($tc['canonical_path'], $cond, FALSE, $x, TRUE, array("?x$x"));
+    $rows = $store->query($sparql, 'rows');
+
+    if ($store->getErrors()) {
+      return array(FALSE, $store->getErrors());
+    }
+
+    foreach ($rows as $r) {
+      $text_insts[$r["x$x"]] = $tc['groups'][0];
+    }
+  }
+  
+  return array(TRUE, $text_insts);
+
+}
+
+
+function wisski_textrefs_delete_references($insts, $text_insts) {
+  $insts = (array) $insts;
+  $text_insts = (array) $text_insts;
+  $encoded_uris = array_map('_wisski_textrefs_encode_uri_component', $insts);
+  $encoded_uris = array_map('wisski_store_escape_sparql_regex', $encoded_uris);
+  $encoded_uris = join('|', $encoded_uris);
+
+  $errors = array();
+  
+  foreach ($text_insts as $ti) {
+    list($ok, $texts) = wisski_textmod_get_texts($ti, TRUE, FALSE);
+    if (!$ok) {
+      $errors = array_merge($errors, (array) $texts);
+      $errors[] = t('Could not properly delete references from text !l. Please revise manually.', array('!l' => l($ti, $ti)));
+      continue;
+    }
+    
+    $new_text = $texts[0]['text'];
+    
+    // delete references
+    // the span tag should only have encode the annotation,
+    // so we can savely delete all attributes. This is done to also delete rdfa
+    // there remains an "empty" span tag, that does not harm.
+    $regex  = '!<span\s+'; 
+    $regex .= "(?:[^>=]+=(?:'[^']*'|\"[^\"]*\")\s+)*"; // random leading attributes
+    $regex .= "class=[\"'](?:[^\"']*\s)"; // leading classes in the class attrib 
+    $regex .= "wisski_anno_uri_(?:$encoded_uris)"; // the inportant part that tells us whether this is the right span
+    $regex .= "(?:\s[^\"']*)?[\"']"; // leading classes in the class attrib 
+    $regex .= "(?:\s+[^>=]+=(?:'[^']*'|\"[^\"]*\"))*\s*>!u"; // random trailing attributes
+    $new_text = preg_replace($regex, '<span>', $new_text);
+
+    // delete relation references
+    // we only delete the relation class inside the class attrib
+    $regex = "/wisski_anno_rel_\d+:(?:$encoded_uris)/u"; // the actual relation that should be deleted
+    $new_text = preg_replace($regex, '', $new_text);
+
+    list($ok, $err) = wisski_textmod_set_own_text($new_text, $ti, $texts[0]['pid']);
+    if (!$ok) {
+      $errors[] = $err;
+      $errors[] = t('Could not delete references from text !l. Please revise manually.', array('!l' => l($ti, $ti)));
+    }
+    
+  }
+
+  return array(empty($errors), $errors);
+
+}
+ 
+
+
+/** Taken from http://stackoverflow.com/a/1734255
+*/
+function _wisski_textrefs_encode_uri_component($str) {
+  $revert = array('%21'=>'!', '%2A'=>'*', '%27'=>"'", '%28'=>'(', '%29'=>')');
+  return strtr(rawurlencode($str), $revert);
+}

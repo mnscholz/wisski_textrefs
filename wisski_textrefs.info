@@ -1,0 +1,8 @@
+; $Id$
+name = Text References Management 
+description = Provide a list of texts that refer to an entity and bulk operations for deletion.
+core = 6.x
+version = "0.1-dev"
+package = "WissKI Text"
+dependencies[] = wisski_textmod
+
